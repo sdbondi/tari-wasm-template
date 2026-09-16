@@ -72,15 +72,16 @@ mod template {
                 // rule later — swap to LOCKED to make any given rule permanent.
                 .mintable(require_admin.clone(), OWNER)
                 .burnable(require_admin.clone(), OWNER)
-                // Both sides of a user transfer are authorized by the hook below rather than by a
-                // rule: a rule is evaluated in the frame that acts on the vault, which for a user is
-                // their own account component, and a badge proof created by the transaction does not
-                // reach that frame. The hook can see the calling account's state, so it can check
-                // badge ownership directly.
+                // A deposit is authorized by the hook below rather than by a rule. The rule would be
+                // evaluated in the receiving account's frame, and a sender cannot get a badge proof
+                // into an account it does not own - `deposit_with_auth` is owner-restricted. The hook
+                // can see the receiving account's state, so it checks badge ownership directly.
                 .depositable(AccessRule::AllowAll, OWNER)
-                .withdrawable(AccessRule::AllowAll, OWNER)
+                // A withdrawal is made by the owner, who passes their badge proof to the account's
+                // `withdraw_with_auth`; a proof passed as a call argument authorizes for that frame.
+                .withdrawable(require_user.clone(), OWNER)
                 .recallable(require_admin.clone(), OWNER)
-                .with_authorization_hook(component_alloc.get_address(), "authorize_user_transfer")
+                .with_authorization_hook(component_alloc.get_address(), "authorize_user_deposit")
                 .with_view_key(view_key)
                 .initial_supply(initial_supply_proof);
 
@@ -107,7 +108,7 @@ mod template {
                 .add_method_rule("total_supply", AccessRule::AllowAll)
                 .add_method_rule("exchange_stable_for_wrapped_tokens", require_user.clone())
                 .add_method_rule("exchange_wrapped_for_stable_tokens", require_user.clone())
-                .add_method_rule("authorize_user_transfer", AccessRule::AllowAll)
+                .add_method_rule("authorize_user_deposit", AccessRule::AllowAll)
                 .default(require_admin);
 
             // Create component
@@ -128,41 +129,30 @@ mod template {
             admin_badge
         }
 
-        /// Authorization hook for the stable coin resource. Both sides of a transfer are gated on the
-        /// calling account owning a user badge: the engine evaluates a resource rule in the frame that
-        /// acts on the vault, so a badge proof created by the transaction does not reach `Account::withdraw`
-        /// and the check has to be made here, against the caller's own state.
-        pub fn authorize_user_transfer(&self, action: ResourceAuthAction, caller: AuthHookCaller) {
-            let verb = match action {
-                ResourceAuthAction::Deposit => "deposit",
-                ResourceAuthAction::Withdraw => "withdraw",
-                // Mint, burn and recall are covered by the resource access rules.
-                _ => return,
-            };
+        pub fn authorize_user_deposit(&self, action: ResourceAuthAction, caller: AuthHookCaller) {
+            match action {
+                ResourceAuthAction::Deposit => {
+                    let Some(component_state) = caller.component_state() else {
+                        panic!("deposit not permitted from static template function")
+                    };
+                    info!(
+                        "Authorizing deposit for user with component {}",
+                        caller.component().unwrap()
+                    );
+                    let user_account =
+                        Account::from_value(component_state).expect("not called from an account");
+                    let vault = user_account
+                        .get_vault_by_resource(&self.user_auth_resource)
+                        .expect("This account does not have permission to deposit");
 
-            // This component moves its own tokens in and out of its treasury vault. Those methods are
-            // already gated by the component access rules, so the caller needs no badge of its own.
-            if caller.component() == Some(&CallerContext::current_component_address()) {
-                return;
-            }
-
-            let Some(component_state) = caller.component_state() else {
-                panic!("{verb} not permitted from static template function")
-            };
-            info!(
-                "Authorizing {} for user with component {}",
-                verb,
-                caller.component().unwrap()
-            );
-            let user_account =
-                Account::from_value(component_state).expect("not called from an account");
-            let vault = user_account
-                .get_vault_by_resource(&self.user_auth_resource)
-                .unwrap_or_else(|| panic!("This account does not have permission to {verb}"));
-
-            // User must own a badge of this user auth resource. The badge may be locked when sending to self.
-            if vault.balance().is_zero() && vault.locked_balance().is_zero() {
-                panic!("This account does not have permission to {verb}");
+                    // User must own a badge of this user auth resource. The badge may be locked when sending to self.
+                    if vault.balance().is_zero() && vault.locked_balance().is_zero() {
+                        panic!("This account does not have permission to deposit");
+                    }
+                }
+                _ => {
+                    // Withdraws etc are permitted as per normal resource access rules
+                }
             }
         }
 
